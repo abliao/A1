@@ -17,4 +17,8 @@ if [ -n "$CONDA_ROOT" ] && [ -n "$CONDA_ENV" ]; then
   conda activate "$CONDA_ENV"
 fi
 
-python robot_experiments/vlabench/eval_client.py
+# Allow save_dir to be overridden via environment variable
+save_dir="${SAVE_DIR:-outputs/vlabench}"
+
+python robot_experiments/vlabench/eval_client.py \
+--save_dir $save_dir

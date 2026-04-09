@@ -5,11 +5,23 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2604.05672">
+    <img src="https://img.shields.io/badge/arXiv-2604.05672-red?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv">
+  </a>
+  <a href="https://github.com/ATeam-Research/A1">
+    <img src="https://img.shields.io/badge/Code-GitHub-black?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
+  </a>
+  <a href="http://www.ateam.xin/#/research/A1">
+    <img src="https://img.shields.io/badge/Project-Page-blue?style=for-the-badge&logo=internet-explorer&logoColor=white" alt="Project Page">
+  </a>
+</p>
+
+<!-- <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10">
   <img src="https://img.shields.io/badge/PyTorch-2.6.0-orange?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/CUDA-12.4-green?style=for-the-badge&logo=nvidia&logoColor=white" alt="CUDA 12.4">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License">
-</p>
+</p> -->
 
 ---
 
@@ -329,3 +341,21 @@ bash train_rc.sh
 ## 🙏 Acknowledgements
 
 This project is built upon the [Molmo](https://github.com/allenai/molmo) project. We thank the Allen Institute for AI for their excellent open-source work.
+
+---
+
+## 📚 Citation
+
+If you find this work useful for your research, please consider citing:
+
+```bibtex
+@misc{zhang2026a1fullytransparentopensource,
+      title={A1: A Fully Transparent Open-Source, Adaptive and Efficient Truncated Vision-Language-Action Model}, 
+      author={Kaidong Zhang and Jian Zhang and Rongtao Xu and Yu Sun and Shuoshuo Xue and Youpeng Wen and Xiaoyu Guo and Minghao Guo and Weijia Liufu and Liu Zihou and Kangyi Ji and Yangsong Zhang and Jiarun Zhu and Jingzhi Liu and Zihang Li and Ruiyi Chen and Meng Cao and Jingming Zhang and Shen Zhao and Xiaojun Chang and Feng Zheng and Ivan Laptev and Xiaodan Liang},
+      year={2026},
+      eprint={2604.05672},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2604.05672}, 
+}
+```

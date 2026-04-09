@@ -97,7 +97,7 @@ class GenerateConfig:
     use_proprio: bool = True                         # Whether to include proprio state in input
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
-    num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
+    num_open_loop_steps: int = 5                     # Number of actions to execute open-loop before requerying policy
 
     unnorm_key: Union[str, Path] = ""                # Action un-normalization key
 
@@ -163,7 +163,7 @@ class A1(Policy):
             actions = response.json()["predicted_actions"]
             
             actions = np.array(actions)
-            actions[:, 3] = observation["state"][3]
+            # actions[:, 3] = observation["state"][3]
             actions[:, 4] = observation["state"][4]
             actions = actions.tolist()
             self.action_plan.extend(actions[:self.replan_steps])
@@ -175,8 +175,6 @@ class A1(Policy):
             gripper_state = np.zeros(2)
         target_pos = target_pos.copy()
         target_pos += np.array([0, -0.4, 0.78])
-        print('observation["state"]',obs["ee_state"][:3])
-        print('target_pos',target_pos)
         return target_pos, target_euler, gripper_state
     
     @property
