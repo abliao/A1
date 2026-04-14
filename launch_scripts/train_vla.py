@@ -165,6 +165,7 @@ if __name__ == "__main__":
         # 从 YAML 配置中读取 HF VLA 后端设置（可选）
         vla_backend = vla_cfg["model"].get("vla_backend", None)
         qwen3_hf_model_name_or_path = vla_cfg["model"].get("qwen3_hf_model_name_or_path", None)
+        gemma_hf_model_name_or_path = vla_cfg["model"].get("gemma_hf_model_name_or_path", None)
         action_head_cfg = vla_cfg["model"]["action_head"]
         fixed_action_dim = action_head_cfg["fixed_action_dim"]
         proprio_dim = fixed_action_dim
@@ -317,6 +318,8 @@ if __name__ == "__main__":
             model_cfg = replace(model_cfg, vla_backend=vla_backend)
         if qwen3_hf_model_name_or_path is not None:
             model_cfg = replace(model_cfg, qwen3_hf_model_name_or_path=qwen3_hf_model_name_or_path)
+        if gemma_hf_model_name_or_path is not None:
+            model_cfg = replace(model_cfg, gemma_hf_model_name_or_path=gemma_hf_model_name_or_path)
 
         evaluator = DatasetEvaluatorConfig(
             label="val",

@@ -158,7 +158,7 @@ def main(cfg: TrainConfig) -> None:
     barrier()
 
     # Construct data loader.
-    if cfg.model.vla_backend=='hf_qwenvl':
+    if cfg.model.vla_backend in ('hf_qwenvl', 'hf_gemma', 'hf_paligemma'):
         cfg.data.use_hf_vla_format = True
     train_loader = build_vla_train_dataloader(cfg, device)
     log.info("Build train_dataloader successful!")
@@ -181,6 +181,9 @@ def main(cfg: TrainConfig) -> None:
     if cfg.model.vla_backend in ("hf_qwenvl", "hf_qwen3_vl"):
         from a1.vla.vla_qwen3_hf import VLAQwen3HF
         olmo_model = VLAQwen3HF(cfg.model)
+    elif cfg.model.vla_backend in ("hf_gemma", "hf_paligemma"):
+        from a1.vla.vla_gemma_hf import VLAGemmaHF
+        olmo_model = VLAGemmaHF(cfg.model)
     else:
         if cfg.early_exit:
             olmo_model = AffordVLAEarlyExit(cfg.model)
@@ -220,7 +223,7 @@ def main(cfg: TrainConfig) -> None:
     if not cfg.ft_llm:
         log.info(f"Freezing LLM")
         freeze_parameters_by_name(olmo_model, olmo_model.get_llm_parameters(), warn=False)
-    if not cfg.model.vla_backend in ("hf_qwenvl", "hf_qwen3_vl") and cfg.ft_embedding != "all":
+    if cfg.model.vla_backend not in ("hf_qwenvl", "hf_qwen3_vl", "hf_gemma", "hf_paligemma") and cfg.ft_embedding != "all":
         if cfg.ft_embedding == "ln_f":
             log.info(f"Freezing LLM: wte.embedding, ff_out")
             freeze_names = ["transformer.wte.embedding", "transformer.wte.weight"]

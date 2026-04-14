@@ -433,7 +433,12 @@ class HFQwenVLCollatorForAction:
         self.resize = resize
         self.pad_value = pad_value
 
-        model_name = getattr(model_config, "qwen3_hf_model_name_or_path")
+        model_name = (
+            getattr(model_config, "qwen3_hf_model_name_or_path", None)
+            or getattr(model_config, "gemma_hf_model_name_or_path", None)
+        )
+        if model_name is None:
+            raise ValueError("HFQwenVLCollatorForAction 需要设置 qwen3_hf_model_name_or_path 或 gemma_hf_model_name_or_path")
         try:
             from transformers import AutoProcessor
         except ImportError as e:

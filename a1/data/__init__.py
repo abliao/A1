@@ -47,7 +47,7 @@ def build_mm_preprocessor(
     # 对这类配置，返回一个"空"预处理器：只保留 tokenizer，样本原样透传，
     # 由 HF collator + HF 模型自己完成 encode。
     vla_backend = str(getattr(model_config, "vla_backend", "molmo")).lower()
-    if vla_backend in ("hf_qwenvl", "hf_qwen3_vl", "hf"):
+    if vla_backend in ("hf_qwenvl", "hf_qwen3_vl", "hf_gemma", "hf_paligemma", "hf"):
         return _IdentityPreprocessor(model_config.get_tokenizer())
 
     v_cfg = model_config.vision_backbone
@@ -347,7 +347,7 @@ def build_vla_train_dataloader(train_config: TrainConfig, device=None, use_hf_fo
     # 推荐只用一个开关：model.vla_backend = "hf_qwenvl" 来切换 HF 流程；
     # data.use_hf_vla_format 作为兼容性兜底（不建议单独启用，否则会与 Molmo 模型不匹配）。
     backend = str(getattr(train_config.model, "vla_backend", "molmo")).lower()
-    if backend in ("hf_qwenvl", "hf_qwen3_vl"):
+    if backend in ("hf_qwenvl", "hf_qwen3_vl", "hf_gemma", "hf_paligemma"):
         use_hf_format = True
     else:
         use_hf_format = use_hf_format or bool(getattr(train_config.data, "use_hf_vla_format", False))

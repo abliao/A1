@@ -455,6 +455,11 @@ class ModelConfig(BaseConfig):
     HuggingFace 模型名或路径，用于 AffordVLAQwen3（例如 "Qwen/Qwen3-4B"）。
     若为 None，AffordVLAQwen3 默认使用 "Qwen/Qwen3-4B"。
     """
+    gemma_hf_model_name_or_path: Optional[str] = None
+    """
+    HuggingFace 模型名或路径，用于 VLAGemmaHF（例如 "google/paligemma-3b-pt-224"）。
+    若为 None，VLAGemmaHF 默认使用 "google/paligemma-3b-pt-224"。
+    """
 
     low_cpu_fsdp: bool = True
     """
