@@ -77,3 +77,5 @@ launch_scripts/sbatch
 /*.ipynb
 
 /.cluster_snapshots
+
+references/

@@ -353,9 +353,13 @@ class RotaryEmbedding(nn.Module):
         )
 
     def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        try:
+            pos_sin, pos_cos = self.__cache["rope_pos_sin"], self.__cache["rope_pos_cos"]
+        except KeyError:
+            pos_sin = pos_cos = None
         if (
-            (pos_sin := self.__cache.get("rope_pos_sin")) is not None
-            and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
+            pos_sin is not None
+            and pos_cos is not None
             and pos_sin.shape[-2] >= seq_len
             and pos_cos.shape[-2] >= seq_len
         ):
@@ -521,6 +525,7 @@ def causal_attention_bias(seq_len: int, device: torch.device) -> torch.FloatTens
     return att_bias.view(1, 1, seq_len, seq_len)  # type: ignore
 
 
+@torch.compiler.disable
 def get_causal_attention_bias(cache: BufferCache, seq_len: int, device: torch.device) -> torch.Tensor:
     if (causal_bias := cache.get("causal_attention_bias")) is not None and causal_bias.shape[-1] >= seq_len:
         if causal_bias.device != device:

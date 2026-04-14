@@ -2,6 +2,7 @@ from typing import Dict, Any, List
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 # from a1.vla.constants import NUM_ACTIONS_CHUNK, ACTION_DIMS_MAPPING
@@ -15,6 +16,13 @@ from a1.tokenizer import (RIGHT_EEF_X_AXIS_TOKEN,RIGHT_EEF_Y_AXIS_TOKEN,RIGHT_EE
                             RIGHT_EEF_ROLL_TOKEN,RIGHT_EEF_PITCH_TOKEN,RIGHT_EEF_YAW_TOKEN,RIGHT_EEF_GRIPPER_TOKEN)
 from a1.tokenizer import (LEFT_EEF_X_AXIS_TOKEN,LEFT_EEF_Y_AXIS_TOKEN,LEFT_EEF_Z_AXIS_TOKEN,
                             LEFT_EEF_ROLL_TOKEN,LEFT_EEF_PITCH_TOKEN,LEFT_EEF_YAW_TOKEN,LEFT_EEF_GRIPPER_TOKEN)
+from a1.data.model_preprocessor import (
+    load_image,
+    resize_and_pad,
+    siglip_resize_and_pad,
+    dino_resize_and_pad,
+    metaclip_resize,
+)
 
 numpy_to_torch_dtype_dict = {
     np.dtype("bool"): torch.bool,
@@ -393,7 +401,154 @@ class MMCollatorForAction:
         
         action_tokens.append(self.action_end_token_id)
         return np.array(action_tokens, dtype=np.int32)
-    
+
+
+class HFQwenVLCollatorForAction:
+    """
+    HF(Qwen3-VL/Qwen2.5-VL) 后端的 collator：
+    - 使用 transformers.AutoProcessor.apply_chat_template 生成 input_ids/attention_mask 以及视觉输入张量
+    - 不使用 Molmo 的 preprocessor / image_input_idx
+    - 输出键尽量对齐 VLATrainer.model_forward 所需字段：input_ids / attention_mask / images / action / action_pad_mask / proprio / proprio_token_idx
+    """
+
+    def __init__(
+        self,
+        model_config,
+        use_proprio: bool = False,
+        include_metadata: bool = False,
+        add_generation_prompt: bool = True,
+        base_image_input_size: tuple = (224, 224),
+        resize: str = "default",
+        pad_value: float = 0,
+    ):
+        self.model_config = model_config
+        self.use_proprio = use_proprio
+        self.include_metadata = include_metadata
+        self.add_generation_prompt = add_generation_prompt
+        self.base_image_input_size = (
+            (base_image_input_size, base_image_input_size)
+            if isinstance(base_image_input_size, int)
+            else tuple(base_image_input_size)
+        )
+        self.resize = resize
+        self.pad_value = pad_value
+
+        model_name = getattr(model_config, "qwen3_hf_model_name_or_path")
+        try:
+            from transformers import AutoProcessor
+        except ImportError as e:
+            raise ImportError("HFQwenVLCollatorForAction 需要 transformers") from e
+
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        if hasattr(self.processor, "tokenizer") and getattr(self.processor.tokenizer, "padding_side", None) is not None:
+            self.processor.tokenizer.padding_side = "left"
+
+    @staticmethod
+    def _to_pil(img):
+        """
+        使用 model_preprocessor.load_image 的读取逻辑，保证与原 Molmo 路径一致：
+        - 支持 PIL.Image / np.ndarray / 路径
+        - 始终返回 RGB uint8 的 numpy，再转成 PIL.Image
+        """
+        arr = load_image(img)  # (H, W, 3) uint8
+        return Image.fromarray(arr)
+
+    def _resize_image(self, image: np.ndarray, is_training: bool = True) -> np.ndarray:
+        """
+        参考 model_preprocessor.MultiModalPreprocessor.resize_image：
+        对图像进行 resize，输出保持与原格式兼容（uint8），供 processor 使用。
+        """
+        output_size = self.base_image_input_size
+        if self.resize == "siglip":
+            resized, _ = siglip_resize_and_pad(image, output_size)
+        elif self.resize == "dino":
+            resized, _ = dino_resize_and_pad(image, output_size)
+        elif self.resize == "metaclip":
+            resized, _ = metaclip_resize(image, output_size)
+        else:
+            resize_method = "torch-bilinear" if self.resize == "default" else self.resize
+            resized, _ = resize_and_pad(
+                image,
+                output_size,
+                pad_value=self.pad_value,
+                is_training=is_training,
+                resize_method=resize_method,
+            )
+        # 转为 uint8，与 load_image 输出一致，供 HF processor 使用
+        resized = (np.clip(resized, 0.0, 1.0) * 255).astype(np.uint8)
+        return resized
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        assert len(batch) > 0, "Given an empty batch"
+
+        # 1) 构造 messages
+        messages_list = []
+        for ex in batch:
+            images = None
+            if "images" in ex:
+                try:
+                    images = [
+                        img if isinstance(img, np.ndarray) else load_image(img)
+                        for img in ex["images"]
+                    ]
+                except Exception:
+                    raise ValueError("Error loading images")
+            elif "image" in ex:
+                try:
+                    images = [load_image(ex["image"])]
+                except Exception as e:
+                    raise ValueError(f"Could not load image: {ex['image']}")
+            # 对每张图像进行 resize（参考 model_preprocessor.resize_image）
+            resized_images = [self._resize_image(img) for img in images]
+            pil_imgs = [Image.fromarray(img) for img in resized_images]
+
+            instruction = ex.get("question") or (ex.get("metadata") or {}).get("instruction", "")
+            if isinstance(instruction, bytes):
+                instruction = instruction.decode("utf-8", errors="replace")
+
+            content = [{"type": "image", "image": im} for im in pil_imgs]
+            content.append({"type": "text", "text": instruction})
+            msg = [{"role": "user", "content": content}]
+            messages_list.append(msg)
+
+        proc_out = self.processor.apply_chat_template(
+            messages_list,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=self.add_generation_prompt,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+        # 2) 组装输出 batch（尽量保持 VLATrainer 期望的键）
+        out: Dict[str, Any] = {
+            "vlm_inputs": proc_out,
+            "input_ids": proc_out["input_ids"],
+        }
+
+        # 3) 动作与 mask
+        action_list = [torch.from_numpy(np.asarray(ex["action"], dtype=np.float32).copy()) for ex in batch]
+        out["action"] = torch.stack(action_list, dim=0)
+
+        if any("action_pad_mask" in ex for ex in batch):
+            apm = [torch.from_numpy(np.asarray(ex.get("action_pad_mask"), dtype=bool).copy()) for ex in batch]
+            out["action_pad_mask"] = torch.stack(apm, dim=0)
+        else:
+            out["action_pad_mask"] = torch.zeros_like(out["action"], dtype=torch.bool)
+
+        # 4) proprio（可选）
+        if self.use_proprio and any(ex.get("proprio") is not None for ex in batch):
+            proprio_list = [torch.from_numpy(np.asarray(ex["proprio"], dtype=np.float32).copy()) for ex in batch]
+            out["proprio"] = torch.stack(proprio_list, dim=0)
+
+        # trainer/model_forward 里是 batch["proprio_token_idx"] 强制索引，这里给一个占位即可
+        out["proprio_token_idx"] = torch.zeros((len(batch),), dtype=torch.int32)
+
+        if self.include_metadata:
+            out["metadata"] = [ex.get("metadata", {}) for ex in batch]
+
+        return out
+
 
 class DiTActionCollator:
     """用于 DiffusionTransformerAction 模型的简洁 collator"""

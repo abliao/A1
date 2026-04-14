@@ -15,7 +15,7 @@ from a1.torch_util import get_world_size
 from a1 import TrainConfig, WandbConfig, DataConfig, OptimizerConfig, OptimizerType, \
     SchedulerConfig, SchedulerType, FSDPConfig, FSDPPrecision, FSDPWrapStrategy
 from a1.config import BatchDivisor, SpeedMonitorConfig, ActivationCheckpointingStrategy, \
-    DatasetEvaluatorConfig, ModelConfig
+    DatasetEvaluatorConfig, ModelConfig, FSDPMode
 from a1.util import (
     add_cached_path_clients,
     clean_opt,
@@ -30,6 +30,10 @@ from scripts.train_for_action import main as train
 # 启用内存效率优化
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# 屏蔽 httpx/huggingface 等库的 INFO 日志
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # import os
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] ='max_split_size_mb:256,expandable_segments:True'  # 'max_split_size_mb:512'
@@ -126,6 +130,8 @@ if __name__ == "__main__":
 
         parser.add_argument("--use_proprio",default=True,type=bool)
         parser.add_argument("--use_wrist_image",default=True,type=bool,help="Whether to use wrist image in the dataset")
+        parser.add_argument("--image_size", nargs=2, type=int, default=[224, 224], metavar=("H", "W"),
+            help="Image (height, width) for HF VLA collator resize, default 224 224")
         parser.add_argument("--dataset", default="vla_dataset_realworld")
 
 
@@ -142,6 +148,8 @@ if __name__ == "__main__":
             default="libero_simulation.yaml",
             help="VLA config file name. Auto-searches in: configs/experiments/, configs/, launch_scripts/"
         )
+        parser.add_argument("--fsdp_mode", choices=["fsdp1", "fsdp2"], default="fsdp1",
+            help="FSDP implementation: fsdp1 (default) or fsdp2 (composable, requires torch>=2.4, VLAQwen3HF only)")
 
 
         args, other_args = parser.parse_known_args()
@@ -154,6 +162,9 @@ if __name__ == "__main__":
         os.environ["VLA_CONFIG_YAML"] = yaml_name
 
         vla_cfg = read_vla_yaml_config(yaml_name)
+        # 从 YAML 配置中读取 HF VLA 后端设置（可选）
+        vla_backend = vla_cfg["model"].get("vla_backend", None)
+        qwen3_hf_model_name_or_path = vla_cfg["model"].get("qwen3_hf_model_name_or_path", None)
         action_head_cfg = vla_cfg["model"]["action_head"]
         fixed_action_dim = action_head_cfg["fixed_action_dim"]
         proprio_dim = fixed_action_dim
@@ -301,6 +312,12 @@ if __name__ == "__main__":
                 )
                 
 
+        # 将 YAML 中的 HF VLA 后端配置写入 model_cfg
+        if vla_backend is not None:
+            model_cfg = replace(model_cfg, vla_backend=vla_backend)
+        if qwen3_hf_model_name_or_path is not None:
+            model_cfg = replace(model_cfg, qwen3_hf_model_name_or_path=qwen3_hf_model_name_or_path)
+
         evaluator = DatasetEvaluatorConfig(
             label="val",
             subset_num_batches=eval_examples//(args.device_eval_batch_size*get_world_size()),
@@ -343,6 +360,7 @@ if __name__ == "__main__":
                 dataset=args.dataset,
                 use_wrist_image=args.use_wrist_image,  # Set to True if you want to use wrist images
                 use_proprio=args.use_proprio,  # Set to True if you want to use proprioceptive data
+                image_size=tuple(args.image_size),
                 for_inference=False,
                 shuffle=True,
                 split="train",
@@ -394,7 +412,8 @@ if __name__ == "__main__":
                 use_orig_params=True,
                 wrapping_strategy=FSDPWrapStrategy.by_block_and_size,
                 # wrapping_strategy=FSDPWrapStrategy.by_block,
-                precision=FSDPPrecision.float
+                precision=FSDPPrecision.float,
+                fsdp_mode=FSDPMode[args.fsdp_mode],
                 # precision=FSDPPrecision.mixed
             ),
             load_path=args.load_path,

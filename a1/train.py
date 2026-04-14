@@ -32,6 +32,7 @@ from .checkpoint import Checkpointer, FullCheckpointer, build_sharded_checkpoint
 from .config import (
     BlockType,
     CheckpointType,
+    FSDPMode,
     SchedulerUnits,
     ShardedCheckpointerType,
     SpeedMonitorConfig,
@@ -1007,14 +1008,32 @@ class Trainer:
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
-        optim_metrics = self.optim.clip_grads_and_collect_metrics(
-            self.global_step,
-            collect_param_metrics=should_log_optim_metrics_this_step,
-            # passing this process group here ensures metrics are reduced correctly when we're using
-            # HYBRID sharding.
-            process_group=self.fsdp_model.process_group,
-            multi_modal=self.cfg.model.vision_backbone is not None,
-        )
+        use_fsdp2 = getattr(self.cfg.fsdp, "fsdp_mode", None) == FSDPMode.fsdp2
+        if use_fsdp2:
+            max_norm = max(
+                (g.get("max_grad_norm") or self.cfg.max_grad_norm)
+                for g in self.optim.param_groups
+            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.fsdp_model.parameters(), max_norm, foreach=True
+            )
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor()
+            grad_norm_val = grad_norm.item() if grad_norm.numel() == 1 else float(grad_norm)
+            device = next(self.fsdp_model.parameters()).device
+            grad_norm_t = torch.tensor([grad_norm_val], device=device, dtype=torch.float32)
+            dist.all_reduce(
+                grad_norm_t, op=dist.ReduceOp.SUM, group=self.fsdp_model.process_group
+            )
+            grad_norm_t.div_(dist.get_world_size(self.fsdp_model.process_group))
+            optim_metrics = {"total_grad_norm": grad_norm_t.squeeze(0)}
+        else:
+            optim_metrics = self.optim.clip_grads_and_collect_metrics(
+                self.global_step,
+                collect_param_metrics=should_log_optim_metrics_this_step,
+                process_group=self.fsdp_model.process_group,
+                multi_modal=self.cfg.model.vision_backbone is not None,
+            )
         # Adjust the learning rate.
         if self.cfg.model.vision_backbone is not None:
             initial_lr_dict = {
@@ -1681,12 +1700,8 @@ class VLATrainer(Trainer):
         cfg: TrainConfig,  
         action_loss_weight: float = 1.0, 
         **kwargs  
-    ):  
-        # 确保使用AffordVLA模型  
-        if not isinstance(kwargs.get('model'), AffordVLA):  
-            log.warning("Model is not AffordVLA, creating AffordVLA instance")  
-            # kwargs['model'] = AffordVLA(cfg.model, action_dim=action_dim)  
-          
+    ):
+
         super().__init__(cfg, **kwargs)  
           
         self.action_loss_weight = action_loss_weight  
@@ -1829,58 +1844,43 @@ class VLATrainer(Trainer):
                 # Mask entire state vector for samples where mask is True
                 action_proprio[mask] = 0.0
         
-        with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-            # logits = self.fsdp_model(
-            # print("Running model forward with actions...")
-            # s_time = time.time()
-            # outputs = self.fsdp_model.forward_with_actions(
-            outputs = self.fsdp_model.forward(
-                input_ids=batch["input_ids"],
+        if self.cfg.data.use_hf_vla_format:
+            # FSDP2 需使用 model() 而非 model.forward() 以触发 pre-forward hooks 将 DTensor 转为普通 Tensor
+            outputs = self.fsdp_model(
+                vlm_inputs=batch,
                 target_actions = batch.get("action"),  ##
-                attention_mask=batch.get("attention_mask"),
-                attention_bias=batch.get("attention_bias"),
-                response_mask=(batch["loss_masks"] > 0) if "loss_masks" in batch else None,
-                images=batch.get("images"),
-                image_masks=batch.get("image_masks"),
-                image_input_idx=batch.get("image_input_idx"),
-                subsegment_ids=batch.get("subsegment_ids"),
-                position_ids=batch.get("position_ids"),
                 action_proprio=action_proprio,  ##
-                proprio_token_idx = batch["proprio_token_idx"],  ##
-                output_hidden_states=True if self.cfg.early_exit and self.cfg.model.action_head != 'flow_matching' else False,
-                train_exit_random_layer = True if self.cfg.train_exit_random_layer else None,
-                use_cache=True if self.cfg.model.action_head == 'flow_matching' else False
             )
-            # ).logits
-            # e_time = time.time()
-            # print("Model forward done. Time taken:", e_time - s_time, "seconds")
-            # logits = outputs["outputs"].logits
             logits = None
-
-
-        if "labels" in batch:
-            assert "loss_masks" in batch
-            # assert loss_reduction == "none"
-            loss_masks = batch["loss_masks"] * (batch["loss_masks"] > 0)
-            labels = batch["labels"].long()
-            labels.masked_fill_(~(loss_masks > 0), -100)
-            labels = labels.view(-1)
-            # logits_for_loss = logits.to(torch.float32).view(-1, logits.size(-1)) # for numerical stability
         else:
-            # logits_for_loss = logits[..., :-1, :].contiguous()
-            # shape: (batch_size * seq_len, vocab_size)
-            # logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
-            # shape: (batch_size, seq_len)
-            labels = self.get_labels(batch)
-            # shape: (batch_size * seq_len,)
-            labels = labels.view(-1)
-        # ce_loss, z_loss = self.loss_fn(
-        #     logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction,
-        #     compute_z_loss=compute_z_loss, z_loss_scale=self.cfg.softmax_auxiliary_loss_scale,
-        # )
+            with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
+                # logits = self.fsdp_model(
+                # print("Running model forward with actions...")
+                # s_time = time.time()
+                # outputs = self.fsdp_model.forward_with_actions(
+                # FSDP2 需使用 model() 而非 model.forward() 以触发 pre-forward hooks
+                outputs = self.fsdp_model(
+                    input_ids=batch["input_ids"],
+                    target_actions = batch.get("action"),  ##
+                    attention_mask=batch.get("attention_mask"),
+                    attention_bias=batch.get("attention_bias"),
+                    response_mask=(batch["loss_masks"] > 0) if "loss_masks" in batch else None,
+                    images=batch.get("images"),
+                    image_masks=batch.get("image_masks"),
+                    image_input_idx=batch.get("image_input_idx"),
+                    subsegment_ids=batch.get("subsegment_ids"),
+                    position_ids=batch.get("position_ids"),
+                    action_proprio=action_proprio,  ##
+                    proprio_token_idx = batch["proprio_token_idx"],  ##
+                    output_hidden_states=True if self.cfg.early_exit and self.cfg.model.action_head != 'flow_matching' else False,
+                    train_exit_random_layer = True if self.cfg.train_exit_random_layer else None,
+                    use_cache=True if self.cfg.model.action_head == 'flow_matching' else False
+                )
+                logits = None
+
         ce_loss, z_loss = 0,0 ##
 
-        bs = batch["input_ids"].shape[0]
+        bs = batch["action"].shape[0]
         if loss_reduction == "none":
             # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
             # ce_loss = ce_loss.view(bs, -1)
@@ -1890,16 +1890,6 @@ class VLATrainer(Trainer):
 
         # accuracy = torch.argmax(logits_for_loss, dim=-1) == labels
         accuracy = 0.1
-        if "labels" in batch:
-            ce_loss = ce_loss * loss_masks
-            if z_loss is not None:
-                z_loss = z_loss * loss_masks
-            # accuracy = accuracy.view(bs, -1)
-            # accuracy = accuracy * loss_masks
-        else:
-            # accuracy = (accuracy * (labels >= 0))
-            # accuracy = accuracy.view(bs, -1)
-            pass
 
         def get_action_loss(pred_acts, diff_pred, diff_target):
             if self.model.config.action_head == "l1_regression":
@@ -2107,14 +2097,33 @@ class VLATrainer(Trainer):
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
-        optim_metrics = self.optim.clip_grads_and_collect_metrics(
-            self.global_step,
-            collect_param_metrics=should_log_optim_metrics_this_step,
-            # passing this process group here ensures metrics are reduced correctly when we're using
-            # HYBRID sharding.
-            process_group=self.fsdp_model.process_group,
-            multi_modal=self.cfg.model.vision_backbone is not None,
-        )
+        use_fsdp2 = getattr(self.cfg.fsdp, "fsdp_mode", None) == FSDPMode.fsdp2
+        if use_fsdp2:
+            # lingbot-vla style: torch.nn.utils.clip_grad_norm_ + simple scalar all_reduce (FSDP2/DTensor compatible)
+            max_norm = max(
+                (g.get("max_grad_norm") or self.cfg.max_grad_norm)
+                for g in self.optim.param_groups
+            )
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.fsdp_model.parameters(), max_norm, foreach=True
+            )
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor()
+            grad_norm_val = grad_norm.item() if grad_norm.numel() == 1 else float(grad_norm)
+            device = next(self.fsdp_model.parameters()).device
+            grad_norm_t = torch.tensor([grad_norm_val], device=device, dtype=torch.float32)
+            dist.all_reduce(
+                grad_norm_t, op=dist.ReduceOp.SUM, group=self.fsdp_model.process_group
+            )
+            grad_norm_t.div_(dist.get_world_size(self.fsdp_model.process_group))
+            optim_metrics = {"total_grad_norm": grad_norm_t.squeeze(0)}
+        else:
+            optim_metrics = self.optim.clip_grads_and_collect_metrics(
+                self.global_step,
+                collect_param_metrics=should_log_optim_metrics_this_step,
+                process_group=self.fsdp_model.process_group,
+                multi_modal=self.cfg.model.vision_backbone is not None,
+            )
 
         if self.cfg.model.vision_backbone is not None:
             initial_lr_dict = {
@@ -2365,7 +2374,7 @@ class VLATrainer(Trainer):
                     speed_monitor.batch_start(
                         self.global_train_tokens_seen,
                         batch_size * seq_len,  # num tokens in batch for this device
-                        (batch["loss_masks"] > 0).sum(),
+                        batch_size * seq_len,
                         # We start monitoring speed after the first batch since the first
                         # batch might be an outlier due to compiling and other initialization overhead.
                         record=not first_batch,

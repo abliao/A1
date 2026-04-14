@@ -12,7 +12,7 @@ from a1.config import DataConfig, TrainConfig, ModelConfig
 from a1.data.academic_datasets import ChartQa, ScienceQAImageOnly, TextVqa, OkVqa, DocQa, \
     InfoQa, AOkVqa, Vqa2, PlotQa, FigureQa, DvQa, SceneTextQa, TabWMPDirectAnswer, \
     AndroidControl, TallyQa, AI2D, CountBenchQa, RealWorldQa, MathVista, MMMU, ClockBench
-from a1.data.collator import MMCollator,MMCollatorForAction
+from a1.data.collator import MMCollator, MMCollatorForAction, HFQwenVLCollatorForAction
 from a1.data.data_formatter import DataFormatter
 from a1.data.dataset import DeterministicDataset,IterableDatasetWrapper
 from a1.data.iterable_dataset_mixture import IterableDatasetMixture,MultiSourceIterableDataset,SimpleMultiSourceIterableDataset
@@ -29,6 +29,12 @@ from a1.data.vla.utils import NormalizationType
 
 log = logging.getLogger(__name__)
 
+class _IdentityPreprocessor:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, item, rng=None):
+        return item
 
 def build_mm_preprocessor(
     model_config: ModelConfig,
@@ -37,6 +43,13 @@ def build_mm_preprocessor(
     is_training=False,
     require_image_features=False
 ):
+    # HF VLA 后端（Qwen-VL）不再使用 Molmo 自己的 MultiModalPreprocessor / vision 代码。
+    # 对这类配置，返回一个"空"预处理器：只保留 tokenizer，样本原样透传，
+    # 由 HF collator + HF 模型自己完成 encode。
+    vla_backend = str(getattr(model_config, "vla_backend", "molmo")).lower()
+    if vla_backend in ("hf_qwenvl", "hf_qwen3_vl", "hf"):
+        return _IdentityPreprocessor(model_config.get_tokenizer())
+
     v_cfg = model_config.vision_backbone
     h, w = model_config.llm_patches_per_crop()
     if not model_config.image_padding_embed:
@@ -257,7 +270,7 @@ def build_train_dataloader(train_config: TrainConfig, device=None) -> DataLoader
     else:
         raise NotImplementedError(train_config.data.multi_modal)
 
-def build_vla_train_dataloader(train_config: TrainConfig, device=None):
+def build_vla_train_dataloader(train_config: TrainConfig, device=None, use_hf_format=False):
     """Build a mixed VLA dataloader from YAML config using factory pattern.
 
     Supports:
@@ -331,6 +344,14 @@ def build_vla_train_dataloader(train_config: TrainConfig, device=None):
     enable_sharpening = image_aug_config.get("enable_sharpening", True)
     augmentation_prob = image_aug_config.get("augmentation_prob", 0.5)
 
+    # 推荐只用一个开关：model.vla_backend = "hf_qwenvl" 来切换 HF 流程；
+    # data.use_hf_vla_format 作为兼容性兜底（不建议单独启用，否则会与 Molmo 模型不匹配）。
+    backend = str(getattr(train_config.model, "vla_backend", "molmo")).lower()
+    if backend in ("hf_qwenvl", "hf_qwen3_vl"):
+        use_hf_format = True
+    else:
+        use_hf_format = use_hf_format or bool(getattr(train_config.data, "use_hf_vla_format", False))
+
     # Build mixed iterable dataset
     mixed = SimpleMultiSourceIterableDataset(
         iterable_sources,
@@ -342,15 +363,32 @@ def build_vla_train_dataloader(train_config: TrainConfig, device=None):
         augmentation_prob=augmentation_prob,
     )
 
-    # Collator for action-style samples
-    collate_f = MMCollatorForAction(
-        model_config=train_config.model,
-        use_proprio=train_config.data.use_proprio,
-        max_sequence_length=train_config.data.sequence_length,
-        include_metadata=False,
-        pad=train_config.data.pad,
-        max_crops=train_config.model.get_max_crops(),
-    )
+    if use_hf_format:
+        # HF(Qwen-VL) 风格：用 AutoProcessor 直接生成 input_ids + vision 张量
+        base_size = getattr(train_config.data, "image_size", (224, 224)) or (224, 224)
+        vb = getattr(train_config.model, "vision_backbone", None)
+        resize_mode = getattr(vb, "resize_mode", "default") if vb else "default"
+        pad_val = getattr(train_config.model, "pad_value", 0.0)
+        collate_f = HFQwenVLCollatorForAction(
+            model_config=train_config.model,
+            use_proprio=train_config.data.use_proprio,
+            include_metadata=False,
+            add_generation_prompt=True,
+            base_image_input_size=base_size,
+            resize=resize_mode,
+            pad_value=pad_val,
+        )
+        log.info("Build HF-format VLA train dataloader (Qwen-VL AutoProcessor).")
+    else:
+        # Collator for action-style samples (Molmo)
+        collate_f = MMCollatorForAction(
+            model_config=train_config.model,
+            use_proprio=train_config.data.use_proprio,
+            max_sequence_length=train_config.data.sequence_length,
+            include_metadata=False,
+            pad=train_config.data.pad,
+            max_crops=train_config.model.get_max_crops(),
+        )
 
     log.info("Build vla train dataloader successfully!")
     return DataLoader(

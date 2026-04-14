@@ -18,7 +18,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP,CPUOffload
 from torch.distributed.fsdp import ShardingStrategy
 
 
-from a1.config import CheckpointType, TrainConfig, ActivationCheckpointingStrategy
+from a1.config import CheckpointType, TrainConfig, ActivationCheckpointingStrategy, FSDPMode, FSDPPrecision
 from a1.data import build_vla_train_dataloader
 from a1.eval import build_loss_evaluators, build_inf_evaluators
 from a1.exceptions import OLMoCliError, OLMoConfigurationError
@@ -100,8 +100,8 @@ def main(cfg: TrainConfig) -> None:
     log.info("Before resume checkpoint... ")
     # Display and save configuration.
     if get_global_rank() == 0:
-        log.info("Configuration:")
-        log.info(cfg)
+        # log.info("Configuration:")
+        # log.info(cfg)
 
         if cfg.allow_resume:
             config_path = Path(cfg.save_folder) / "config.yaml"
@@ -158,6 +158,8 @@ def main(cfg: TrainConfig) -> None:
     barrier()
 
     # Construct data loader.
+    if cfg.model.vla_backend=='hf_qwenvl':
+        cfg.data.use_hf_vla_format = True
     train_loader = build_vla_train_dataloader(cfg, device)
     log.info("Build train_dataloader successful!")
 
@@ -176,10 +178,14 @@ def main(cfg: TrainConfig) -> None:
 
     # Initialize the model.
     log.info(f"Early exit flags: early_exit={cfg.early_exit}")
-    if cfg.early_exit:
-        olmo_model = AffordVLAEarlyExit(cfg.model)
+    if cfg.model.vla_backend in ("hf_qwenvl", "hf_qwen3_vl"):
+        from a1.vla.vla_qwen3_hf import VLAQwen3HF
+        olmo_model = VLAQwen3HF(cfg.model)
     else:
-        olmo_model = AffordVLA(cfg.model)
+        if cfg.early_exit:
+            olmo_model = AffordVLAEarlyExit(cfg.model)
+        else:
+            olmo_model = AffordVLA(cfg.model)
 
     # Pre-load unsharded checkpoint into non-FSDP model if requested via load_path
 
@@ -207,14 +213,14 @@ def main(cfg: TrainConfig) -> None:
 
     # Freeze model components.
     if cfg.model.vision_backbone is not None and not cfg.ft_connector:
-        freeze_parameters_by_name(olmo_model, Molmo.get_connector_parameters(), warn=False) # AffordVLA
+        freeze_parameters_by_name(olmo_model, olmo_model.get_connector_parameters(), warn=False) # AffordVLA
     if cfg.model.vision_backbone is not None and not cfg.ft_vit:
         log.info(f"Freezing vision backbone")
-        freeze_parameters_by_name(olmo_model, Molmo.get_vit_parameters(), warn=False)
+        freeze_parameters_by_name(olmo_model, olmo_model.get_vit_parameters(), warn=False)
     if not cfg.ft_llm:
         log.info(f"Freezing LLM")
-        freeze_parameters_by_name(olmo_model, Molmo.get_llm_parameters(), warn=False)
-    if cfg.ft_embedding != "all":
+        freeze_parameters_by_name(olmo_model, olmo_model.get_llm_parameters(), warn=False)
+    if not cfg.model.vla_backend in ("hf_qwenvl", "hf_qwen3_vl") and cfg.ft_embedding != "all":
         if cfg.ft_embedding == "ln_f":
             log.info(f"Freezing LLM: wte.embedding, ff_out")
             freeze_names = ["transformer.wte.embedding", "transformer.wte.weight"]
@@ -294,89 +300,110 @@ def main(cfg: TrainConfig) -> None:
 
     # Wrap the model in FSDP.
 
-    try:
-        # olmo_model.debug_module_hierarchy()
-        wrap_policy = olmo_model.get_fsdp_wrap_policy(cfg.fsdp.wrapping_strategy)
+    use_fsdp2 = getattr(cfg.fsdp, "fsdp_mode", None) == FSDPMode.fsdp2
 
-        if init_weights or version.parse(torch.__version__) >= version.parse("2.1.0"):
-            # Model is already initialized, so give FSDP a do-nothing init function
-            # so it doesn't re-initialize the parameters
-            def dummy_init_fn(module: torch.nn.Module) -> None:
-                module.to_empty(device=get_default_device(), recurse=False)
+    if use_fsdp2:
+        # FSDP2: composable fully_shard (参考 lingbot-vla torch_parallelize.py)
+        if version.parse(torch.__version__) < version.parse("2.4"):
+            raise OLMoConfigurationError("FSDP2 需要 PyTorch >= 2.4")
+        if not hasattr(olmo_model, "get_fsdp_basic_modules"):
+            raise OLMoConfigurationError("FSDP2 目前仅支持 VLAQwen3HF，模型需实现 get_fsdp_basic_modules")
 
-            param_init_fn = dummy_init_fn
-        else:
-            param_init_fn = None
-    except Exception as e:
-        log.error(f"FSDP wrapping failed: {e}")
-        traceback.print_exc()
-        raise e
-    # print("*****"*5,"FSDP wrap policy:", wrap_policy)
-
-    # Set up device mesh for hybrid sharding in order to specify which nodes are assoicated to a given model replica
-    device_mesh = None
-    hybrid_sharding_fsdp_kwargs = {}
-    if cfg.fsdp.sharding_strategy in (ShardingStrategy.HYBRID_SHARD, ShardingStrategy._HYBRID_SHARD_ZERO2):
-        if version.parse(torch.__version__) < version.parse("2.2.0"):
-            # Device mesh was not added to PyTorch until v2.2.0
-            raise OLMoConfigurationError(
-                "OLMo training does not correctly support hybrid sharding before torch 2.2.0"
-            )
-
+        from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
         from torch.distributed.device_mesh import init_device_mesh
 
-        num_model_replicas = cfg.fsdp.hybrid_sharding_num_model_replicas or (
-            get_world_size() // get_local_world_size()
-        )
+        mesh = init_device_mesh("cuda", (get_world_size(),))
+        basic_modules = olmo_model.get_fsdp_basic_modules()
 
-        if num_model_replicas <= 0:
-            raise OLMoConfigurationError("fsdp.hybrid_sharding_num_model_replicas must be a positive integer")
+        enable_full_shard = cfg.fsdp.sharding_strategy == ShardingStrategy.FULL_SHARD
+        fsdp_kwargs = {
+            "mesh": mesh,
+            "reshard_after_forward": enable_full_shard,
+        }
+        if cfg.fsdp.precision == FSDPPrecision.pure:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=cfg.autocast_precision,
+                reduce_dtype=cfg.autocast_precision,
+                output_dtype=cfg.autocast_precision,
+            )
+        elif cfg.fsdp.precision == FSDPPrecision.mixed:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=cfg.autocast_precision,
+                reduce_dtype=torch.float32,
+                output_dtype=cfg.autocast_precision,
+            )
+        else:
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+        fsdp_kwargs["mp_policy"] = mp_policy
 
-        if get_world_size() % num_model_replicas != 0:
-            raise OLMoConfigurationError("fsdp.hybrid_sharding_num_model_replicas must divide world size")
+        def _apply_fsdp_to_modules(module: torch.nn.Module) -> None:
+            if module.__class__.__name__ in basic_modules:
+                fully_shard(module, **fsdp_kwargs)
 
-        device_mesh = init_device_mesh("cuda", (num_model_replicas, get_world_size() // num_model_replicas))
-        hybrid_sharding_fsdp_kwargs["device_mesh"] = device_mesh
+        if basic_modules:
+            olmo_model.apply(_apply_fsdp_to_modules)
+        fully_shard(olmo_model, **fsdp_kwargs)
 
+        olmo_model.process_group = mesh.get_group(0)
+        fsdp_model = olmo_model
+        log.info("FSDP2 (composable fully_shard) model wrapping successful!")
+    else:
+        # FSDP1: FullyShardedDataParallel
+        try:
+            wrap_policy = olmo_model.get_fsdp_wrap_policy(cfg.fsdp.wrapping_strategy)
 
-    # # 根据GPU数量调整分片策略
-    # world_size = get_world_size()
-    # if world_size == 1:
-    #     log.info("Single GPU training detected, using NO_SHARD strategy")
-    #     sharding_strategy = ShardingStrategy.NO_SHARD
-    #     sync_module_states = False  # 单卡时不需要同步
-    # else:
-    #     sharding_strategy = cfg.fsdp.sharding_strategy
-    log.info("Before FSDP model wrapping")
-    try:
-        # bugs for OLMOE model
-        # ignored_modules = set()
-        # for name, module in olmo_model.transformer.named_modules():
-        #     if isinstance(module, OLMoEBlock):
-        #         # module.ffn 即 dMoE 或 MoE 实例
-        #         ignored_modules.add(module.ffn)
+            if init_weights or version.parse(torch.__version__) >= version.parse("2.1.0"):
+                def dummy_init_fn(module: torch.nn.Module) -> None:
+                    module.to_empty(device=get_default_device(), recurse=False)
+                param_init_fn = dummy_init_fn
+            else:
+                param_init_fn = None
+        except Exception as e:
+            log.error(f"FSDP wrapping failed: {e}")
+            traceback.print_exc()
+            raise e
 
-        fsdp_model = FSDP(
-            olmo_model,
-            # ignored_modules={olmo_model.action_head,olmo_model.proprio_projector},  # Non-root FSDP instance's `_is_root` should not have been set yet or have been set to `False`
-            # ignored_modules = ignored_modules,
-            # sharding_strategy=sharding_strategy,
-            sharding_strategy=cfg.fsdp.sharding_strategy,
-            mixed_precision=cfg.fsdp_precision,
-            auto_wrap_policy=wrap_policy,
-            # cpu_offload=CPUOffload(offload_params=True),  # reduce GPU memory usage
-            use_orig_params=cfg.fsdp.use_orig_params,  # needed for compile and some of our optimizer/parameter metrics
-            limit_all_gathers=True,
-            device_id=get_local_rank(),
-            sync_module_states=sync_module_states,
-            param_init_fn=param_init_fn,
-            **hybrid_sharding_fsdp_kwargs,
-        )
-    except Exception as e:
-        log.info(f"FSDP wrapping failed: {e}")
-        traceback.print_exc()
-        raise e
-    log.info("FSDP model wrapping successful!")
+        device_mesh = None
+        hybrid_sharding_fsdp_kwargs = {}
+        if cfg.fsdp.sharding_strategy in (ShardingStrategy.HYBRID_SHARD, ShardingStrategy._HYBRID_SHARD_ZERO2):
+            if version.parse(torch.__version__) < version.parse("2.2.0"):
+                raise OLMoConfigurationError(
+                    "OLMo training does not correctly support hybrid sharding before torch 2.2.0"
+                )
+            from torch.distributed.device_mesh import init_device_mesh
+            num_model_replicas = cfg.fsdp.hybrid_sharding_num_model_replicas or (
+                get_world_size() // get_local_world_size()
+            )
+            if num_model_replicas <= 0:
+                raise OLMoConfigurationError("fsdp.hybrid_sharding_num_model_replicas must be a positive integer")
+            if get_world_size() % num_model_replicas != 0:
+                raise OLMoConfigurationError("fsdp.hybrid_sharding_num_model_replicas must divide world size")
+            device_mesh = init_device_mesh("cuda", (num_model_replicas, get_world_size() // num_model_replicas))
+            hybrid_sharding_fsdp_kwargs["device_mesh"] = device_mesh
+
+        log.info("Before FSDP model wrapping")
+        try:
+            fsdp_model = FSDP(
+                olmo_model,
+                sharding_strategy=cfg.fsdp.sharding_strategy,
+                mixed_precision=cfg.fsdp_precision,
+                auto_wrap_policy=wrap_policy,
+                use_orig_params=cfg.fsdp.use_orig_params,
+                limit_all_gathers=True,
+                device_id=get_local_rank(),
+                sync_module_states=sync_module_states,
+                param_init_fn=param_init_fn,
+                **hybrid_sharding_fsdp_kwargs,
+            )
+        except Exception as e:
+            log.info(f"FSDP wrapping failed: {e}")
+            traceback.print_exc()
+            raise e
+        log.info("FSDP model wrapping successful!")
     # fsdp_model.action_head.to(device)  # Move action head to device after FSDP wrapping
     # fsdp_model.proprio_projector.to(device)  
     # fsdp_model.transformer.to(device)
@@ -389,7 +416,7 @@ def main(cfg: TrainConfig) -> None:
     log.info(f"Peak GPU Memory (MB) after FSDP: {int(peak_gpu_memory() or 0)}")
     log.info("Model:")
     log.info(fsdp_model)
-
+    # fsdp_model = torch.compile(fsdp_model)
     # print("*****"*13,"FSDP model wrapping successful!")
 
     # Construct optimizer and learning rate scheduler.
@@ -476,6 +503,7 @@ def main(cfg: TrainConfig) -> None:
             log.info(f"Unsharded checkpoint saved to {checkpoint_path}")
 
         if cfg.compile is not None:
+            # FSDP2 + torch.compile causes mixed Tensor/DTensor errors (e.g. embedding). Skip compile for FSDP2.
             # TODO (epwalsh): trying to compile the whole train step results in a compile-time error from within
             # the optimizer. We should investigate this further at some point.
             #  trainer.train_step = torch.compile(trainer.train_step, **cfg.compile.asdict())

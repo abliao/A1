@@ -1,0 +1,2 @@
+model_config: models/robochallenge_qwen3_hf.yaml
+dataset_config: datasets/rc_open_the_drawer.yaml

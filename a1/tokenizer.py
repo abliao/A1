@@ -150,11 +150,13 @@ def build_tokenizer(
         cache_dir=cache_dir,
          ##local_files_only=True,
     )
-    if ("qwen2" in tokenizer_type.lower()) or ("olmo" in tokenizer_type.lower()):
+    if ("qwen2" in tokenizer_type.lower()) or ("qwen3" in tokenizer_type.lower()) or ("olmo" in tokenizer_type.lower()):
         # These tokenizers do not have a BOS, and instead use EOS as a generic seperator token.
         # In this case we will use EOS as BOS
-        assert tokenizer.bos_token_id is None
-        bos_token_id = tokenizer.eos_token_id
+        if tokenizer.bos_token_id is None:
+            bos_token_id = tokenizer.eos_token_id
+        else:
+            bos_token_id = tokenizer.bos_token_id
 
     if pad_tokenizer_to is not None:
         for ix, tok in enumerate(EXTRA_TOKENS):

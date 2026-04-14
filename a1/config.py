@@ -55,6 +55,7 @@ __all__ = [
     "WandbConfig",
     "FSDPPrecision",
     "FSDPWrapStrategy",
+    "FSDPMode",
     "FSDPConfig",
     "CheckpointType",
 ]
@@ -443,6 +444,16 @@ class ModelConfig(BaseConfig):
     llm_load_path: Optional[str] = None
     """
     Use this to partially load the llm transformer.
+    """
+
+    vla_backend: Optional[str] = None
+    """
+    VLA backend to use.
+    """
+    qwen3_hf_model_name_or_path: Optional[str] = None
+    """
+    HuggingFace 模型名或路径，用于 AffordVLAQwen3（例如 "Qwen/Qwen3-4B"）。
+    若为 None，AffordVLAQwen3 默认使用 "Qwen/Qwen3-4B"。
     """
 
     low_cpu_fsdp: bool = True
@@ -1224,7 +1235,16 @@ class DataConfig(BaseConfig):
     # vla dataset settings
     use_wrist_image: bool = False
     use_proprio: bool = False
-    
+
+    lerobot_episode_index_start: Optional[int] = None
+    lerobot_episode_index_end: Optional[int] = None
+
+    use_hf_vla_format: bool = False
+
+    # HF VLA collator: 图像 resize 尺寸，需在 train_config.data 中显式设置
+    image_size: Tuple[int, int] = (224, 224)
+    """Image (height, width) for HF VLA collator resize"""
+
 
     @classmethod
     def update_legacy_settings(cls, config: D) -> D:
@@ -1383,11 +1403,24 @@ class FSDPPrecision(StrEnum):
     float = "float"
 
 
+class FSDPMode(StrEnum):
+    fsdp1 = "fsdp1"
+    """PyTorch FullyShardedDataParallel (FSDP v1)."""
+    fsdp2 = "fsdp2"
+    """PyTorch composable fully_shard (FSDP v2, requires torch>=2.4)."""
+
+
 @dataclass
 class FSDPConfig(BaseConfig):
     use_orig_params: bool = True
     """
     This must be ``True`` if using ``compile`` or you want to track the parameter norm during training.
+    """
+
+    fsdp_mode: FSDPMode = FSDPMode.fsdp1
+    """
+    FSDP implementation: fsdp1 (FullyShardedDataParallel) or fsdp2 (composable fully_shard).
+    fsdp2 requires PyTorch >= 2.4 and supports VLAQwen3HF (HF backend) only.
     """
 
     sharding_strategy: ShardingStrategy = ShardingStrategy.FULL_SHARD

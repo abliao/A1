@@ -17,9 +17,73 @@ from a1.vla.dit.model import DiT
 # from transformers import GemmaForCausalLM, GemmaConfig
 from transformers import Qwen2ForCausalLM, Qwen2Config
 from transformers.cache_utils import DynamicCache
+
+
+def _legacy_cache_to_dynamic(past_key_values):
+    """兼容 Transformers 5.x：from_legacy_cache 已移除，用 ddp_cache_data 初始化"""
+    if hasattr(DynamicCache, "from_legacy_cache"):
+        return _legacy_cache_to_dynamic(past_key_values)
+    return DynamicCache(ddp_cache_data=past_key_values)
+
+
+try:
+    from transformers import Qwen3ForCausalLM, Qwen3Config
+except ImportError:
+    Qwen3ForCausalLM = None
+    Qwen3Config = None
 import contextlib
 from a1.vla.util import make_att_2d_masks, prepare_attention_bias_4d
 
+
+
+class HiddenStatesToKVCache(nn.Module):
+    """
+    将 VLM 所有层的 hidden_states 映射为 KV cache 格式，供 FlowMatchingActionHead 使用。
+    当 gradient checkpointing 导致 use_cache=False、past_key_values 为 None 时，用此模块生成伪 KV。
+    使用 outputs.hidden_states 的每一层（decoder 层输出），按层对应或均匀采样映射到小模型的各层。
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        kv_dim = num_kv_heads * head_dim
+        self.k_projs = nn.ModuleList([nn.Linear(hidden_size, kv_dim) for _ in range(num_layers)])
+        self.v_projs = nn.ModuleList([nn.Linear(hidden_size, kv_dim) for _ in range(num_layers)])
+
+    def forward(
+        self, hidden_states_all: Tuple[torch.Tensor, ...]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        hidden_states_all: HF outputs.hidden_states，tuple 长度为 num_decoder_layers+1，
+            hidden_states_all[0] 为 embedding 输出，hidden_states_all[1:] 为各 decoder 层输出。
+        -> List[(K, V)] 符合 HF legacy cache 格式，长度为 num_layers。
+        """
+        if len(hidden_states_all) == 1:
+            decoder_hiddens = list(hidden_states_all)
+        else:
+            decoder_hiddens = list(hidden_states_all[1:])
+        num_main_layers = len(decoder_hiddens)
+        if num_main_layers == 0:
+            raise ValueError("hidden_states_all 至少需要 1 个元素")
+        B, S, _ = decoder_hiddens[0].shape
+        cache = []
+        for i in range(self.num_layers):
+            main_idx = round(i * (num_main_layers - 1) / max(self.num_layers - 1, 1))
+            h = decoder_hiddens[main_idx]
+            k = self.k_projs[i](h)
+            v = self.v_projs[i](h)
+            k = k.view(B, S, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = v.view(B, S, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            cache.append((k, v))
+        return cache
 
 
 class FlowMatchingActionHead(nn.Module):
@@ -174,7 +238,7 @@ class FlowMatchingActionHead(nn.Module):
         # If legacy list[(k,v), ...] is passed, convert to DynamicCache
         pkv_for_qwen2 = past_key_values
         if past_key_values is not None and not hasattr(past_key_values, "get_seq_length"):
-            pkv_for_qwen2 = DynamicCache.from_legacy_cache(past_key_values)
+            pkv_for_qwen2 = _legacy_cache_to_dynamic(past_key_values)
         
         # Dynamically set qwen2 model inference layers for early exit training
         self.qwen2.model.config.num_hidden_layers = len(past_key_values)
@@ -249,7 +313,7 @@ class FlowMatchingActionHead(nn.Module):
         # If legacy list[(k,v), ...] is passed, convert to DynamicCache
         pkv_for_qwen2 = past_key_values
         if past_key_values is not None and not hasattr(past_key_values, "get_seq_length"):
-            pkv_for_qwen2 = DynamicCache.from_legacy_cache(past_key_values)
+            pkv_for_qwen2 = _legacy_cache_to_dynamic(past_key_values)
         # Dynamically set qwen2 model inference layers for early exit training
         self.qwen2.model.config.num_hidden_layers = len(past_key_values)
 
@@ -283,6 +347,189 @@ class FlowMatchingActionHead(nn.Module):
             torch.tensor(1.0, device=device, dtype=torch.float32)
         ).sample((B,))
         # avoid value error of bf1f and amp
+        t = t.to(torch.float32)
+        t = (t * 0.999 + 0.001)
+        t_exp = t.view(B, 1, 1)
+        x_t_fp32 = t_exp * noise.to(torch.float32) + (1.0 - t_exp) * ground_truth_actions.to(torch.float32)
+        x_t = x_t_fp32.to(ground_truth_actions.dtype)
+        return {"noise": noise, "x_t": x_t, "t": t}
+
+
+class FlowMatchingActionHeadQwen3(FlowMatchingActionHead):
+    """
+    Flow Matching action head 使用 Qwen3 作为 expert backbone（与 FlowMatchingActionHead 接口一致，仅将 Qwen2 换为 Qwen3）。
+    """
+
+    def __init__(
+        self,
+        llm_dim: int = 4096,
+        action_dim: int = 7,
+        proprio_dim: int = 8,
+        horizon: int = 8,
+        qwen3_hidden_size: int = 896,
+        qwen3_num_layers: int = 18,
+        qwen3_num_heads: int = 8,
+        qwen3_intermediate_size: int = 4096,
+        qwen3_num_kv_heads: int | None = None,
+        pvf_func: str = "2d_attn_mask",
+    ):
+        super().__init__()
+        if Qwen3ForCausalLM is None or Qwen3Config is None:
+            raise ImportError("FlowMatchingActionHeadQwen3 需要 transformers 支持 Qwen3（Qwen3ForCausalLM, Qwen3Config）")
+        self.action_dim = action_dim
+        self.proprio_dim = proprio_dim
+        self.horizon = horizon
+        self.qwen3_hidden = qwen3_hidden_size
+        self.qwen3_num_layers = qwen3_num_layers
+        self.qwen3_num_kv_heads = qwen3_num_kv_heads or qwen3_num_heads
+        self.pvf_func = pvf_func
+
+        self.time_encoder = SinusoidalPositionalEncoding(dim=self.qwen3_hidden)
+        self.state_proj = nn.Linear(proprio_dim, self.qwen3_hidden)
+        self.action_in_proj = nn.Linear(action_dim, self.qwen3_hidden)
+        self.action_time_in = nn.Linear(2 * self.qwen3_hidden, self.qwen3_hidden)
+        self.action_time_out = nn.Linear(self.qwen3_hidden, self.qwen3_hidden)
+
+        qwen3_cfg = Qwen3Config(
+            head_dim=qwen3_hidden_size // qwen3_num_heads,
+            hidden_size=qwen3_hidden_size,
+            num_hidden_layers=qwen3_num_layers,
+            num_attention_heads=qwen3_num_heads,
+            intermediate_size=qwen3_intermediate_size,
+            num_key_value_heads=self.qwen3_num_kv_heads,
+        )
+        self.qwen3 = Qwen3ForCausalLM(config=qwen3_cfg)
+        if hasattr(self.qwen3.model, "embed_tokens"):
+            self.qwen3.model.embed_tokens = None
+        self.action_out = MLPResNet(
+            num_blocks=2,
+            input_dim=self.qwen3_hidden,
+            hidden_dim=self.qwen3_hidden,
+            output_dim=action_dim,
+        )
+
+    def build_suffix_tokens(self, state: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x_t.shape
+        head_dtype = self.state_proj.weight.dtype
+        device = x_t.device
+        if state.dim() == 2:
+            state_tok = self.state_proj(state.to(head_dtype)).unsqueeze(1)
+        elif state.dim() == 3:
+            state_tok = self.state_proj(state[:, 0, :].to(head_dtype)).unsqueeze(1)
+        elif state.dim() == 4 and state.shape[1] == 1 and state.shape[2] == 1:
+            state_tok = self.state_proj(state[:, 0, 0, :].to(head_dtype)).unsqueeze(1)
+        else:
+            raise ValueError(f"Unsupported state dim: {state.shape}")
+        t_emb = self.time_encoder(t.to(device)).to(head_dtype)
+        t_tok = t_emb.unsqueeze(1).expand(-1, T, -1)
+        a_tok = self.action_in_proj(x_t.to(head_dtype))
+        at = self.action_time_in(torch.cat([a_tok, t_tok.to(head_dtype)], dim=-1))
+        at = F.silu(at)
+        at = self.action_time_out(at.to(head_dtype))
+        suffix = torch.cat([state_tok.to(head_dtype), at], dim=1)
+        return suffix
+
+    def predict_vector_field(
+        self,
+        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        state: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        pos_offset: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.pvf_func == "2d_attn_mask":
+            return self._predict_vector_field_2d(past_key_values, state, x_t, t, pos_offset)
+        elif self.pvf_func == "4d_attn_mask":
+            return self._predict_vector_field_4d(past_key_values, state, x_t, t, pos_offset)
+        raise ValueError(f"Unsupported pvf_func: {self.pvf_func}")
+
+    def _predict_vector_field_2d(
+        self,
+        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        state: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        pos_offset: torch.Tensor | None,
+    ) -> torch.Tensor:
+        qwen_dtype = next(self.qwen3.parameters()).dtype
+        tgt = self.build_suffix_tokens(state, x_t, t).to(qwen_dtype)
+        B, L = tgt.shape[:2]
+        past_len_for_mask = 0
+        if past_key_values and len(past_key_values) > 0:
+            pk = past_key_values[0][0]
+            if pk.dim() >= 3:
+                past_len_for_mask = int(pk.shape[-2])
+        if past_len_for_mask <= 0:
+            raise ValueError("past_key_values is None or empty")
+        prefix_positions = torch.arange(past_len_for_mask, device=tgt.device).unsqueeze(0).expand(B, -1)
+        valid_prefix_lengths = pos_offset.to(device=tgt.device, dtype=torch.long).clamp_min(0).clamp_max(past_len_for_mask).view(B, 1)
+        prefix_mask = (prefix_positions < valid_prefix_lengths).to(torch.int64)
+        suffix_mask = torch.ones((B, L), dtype=torch.int64, device=tgt.device)
+        attention_mask_2d = torch.cat([prefix_mask, suffix_mask], dim=1)
+        pkv = past_key_values if hasattr(past_key_values, "get_seq_length") else _legacy_cache_to_dynamic(past_key_values)
+        orig_layers = self.qwen3.model.config.num_hidden_layers
+        self.qwen3.model.config.num_hidden_layers = len(past_key_values)
+        outputs = self.qwen3.model(
+            inputs_embeds=tgt,
+            attention_mask=attention_mask_2d,
+            use_cache=False,
+            past_key_values=pkv,
+        )
+        self.qwen3.model.config.num_hidden_layers = orig_layers
+        h = outputs.last_hidden_state[:, -self.horizon:, :]
+        return self.action_out(h).to(x_t.dtype)
+
+    def _predict_vector_field_4d(
+        self,
+        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        state: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        pos_offset: torch.Tensor | None,
+    ) -> torch.Tensor:
+        qwen_dtype = next(self.qwen3.parameters()).dtype
+        tgt = self.build_suffix_tokens(state, x_t, t).to(qwen_dtype)
+        B, L = tgt.shape[:2]
+        tgt_len = tgt.shape[1]
+        base = torch.arange(tgt_len, device=tgt.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+        position_ids = base + pos_offset.view(B, 1)
+        pad_masks = torch.ones((B, L), dtype=torch.bool, device=tgt.device)
+        att_masks = torch.zeros((B, L), dtype=torch.int32, device=tgt.device)
+        att_masks[:, 0] = 1
+        if L > 1:
+            att_masks[:, 1] = 1
+        att_2d = make_att_2d_masks(pad_masks, att_masks)
+        attn_bias_suffix = prepare_attention_bias_4d(att_2d)
+        past_len_for_mask = int(past_key_values[0][0].shape[-2]) if past_key_values else 0
+        if past_len_for_mask > 0:
+            zero_bias_prefix = torch.zeros((B, 1, L, past_len_for_mask), dtype=attn_bias_suffix.dtype, device=attn_bias_suffix.device)
+            attn_mask_4d = torch.cat([zero_bias_prefix, attn_bias_suffix], dim=-1)
+        else:
+            raise ValueError("past_key_values is None or empty")
+        pkv = past_key_values if hasattr(past_key_values, "get_seq_length") else _legacy_cache_to_dynamic(past_key_values)
+        orig_layers = self.qwen3.model.config.num_hidden_layers
+        self.qwen3.model.config.num_hidden_layers = len(past_key_values)
+        outputs = self.qwen3.model(
+            inputs_embeds=tgt,
+            attention_mask=attn_mask_4d,
+            position_ids=position_ids,
+            use_cache=False,
+            past_key_values=pkv,
+        )
+        self.qwen3.model.config.num_hidden_layers = orig_layers
+        h = outputs.last_hidden_state[:, -self.horizon:, :]
+        return self.action_out(h).to(x_t.dtype)
+
+    @torch.no_grad()
+    def sample_noisy_actions(self, ground_truth_actions: torch.Tensor):
+        B = ground_truth_actions.shape[0]
+        device = ground_truth_actions.device
+        dtype = ground_truth_actions.dtype
+        noise = torch.randn_like(ground_truth_actions, device=device, dtype=dtype)
+        t = torch.distributions.Beta(
+            torch.tensor(1.5, device=device, dtype=torch.float32),
+            torch.tensor(1.0, device=device, dtype=torch.float32),
+        ).sample((B,))
         t = t.to(torch.float32)
         t = (t * 0.999 + 0.001)
         t_exp = t.view(B, 1, 1)

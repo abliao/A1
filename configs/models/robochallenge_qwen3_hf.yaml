@@ -1,0 +1,6 @@
+vla_backend: hf_qwenvl
+qwen3_hf_model_name_or_path: "Qwen/Qwen3-VL-4B-Instruct"
+
+action_head:
+  fixed_action_dim: 32
+  num_actions_chunk: 50

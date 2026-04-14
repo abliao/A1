@@ -768,13 +768,13 @@ def get_multimodal_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict
 
     all_params = {}
 
-    connector_params = list(Molmo.get_connector_parameters())
-    vit_params = list(Molmo.get_vit_parameters())
-    llm_params = list(Molmo.get_llm_parameters())
-    
+    connector_params = list(model.get_connector_parameters())
+    vit_params = list(model.get_vit_parameters())
+    llm_params = list(model.get_llm_parameters())
 
-    ah_params = list(AffordVLA.get_act_head_parameters())
-    pp_params = list(AffordVLA.get_proprio_proj_parameters())
+
+    ah_params = list(model.get_act_head_parameters())
+    pp_params = list(model.get_proprio_proj_parameters())
     # FM 模型（AffordVLAFlowMatching）中动作相关层直接挂在顶层而非 action_head
     # 补充这些名称到分组匹配中（并入 LLM 组，与 action_head 处理一致）
     fm_action_related_params = [
@@ -784,7 +784,7 @@ def get_multimodal_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict
         "action_time_mlp_out",
         "action_out_proj",
     ]
-    wd_exclusions = list(Molmo.get_weight_decay_exclusions()) #判断该参数是否应该被排除在权重衰减之外
+    wd_exclusions = list(model.get_weight_decay_exclusions()) #判断该参数是否应该被排除在权重衰减之外
     for mn, m in model.named_modules():
         for pn, p in m.named_parameters():
             # NOTE: because named_modules and named_parameters are recursive
@@ -988,10 +988,10 @@ def get_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]
     no_decay = set()
     all_params = {}
 
-    connector_params = list(Molmo.get_connector_parameters())
-    vit_params = list(Molmo.get_vit_parameters())
-    llm_params = list(Molmo.get_llm_parameters())
-    wd_exclusions = list(Molmo.get_weight_decay_exclusions())
+    connector_params = list(model.get_connector_parameters())
+    vit_params = list(model.get_vit_parameters())
+    llm_params = list(model.get_llm_parameters())
+    wd_exclusions = list(model.get_weight_decay_exclusions())
 
     for mn, m in model.named_modules():
         for pn, p in m.named_parameters():
