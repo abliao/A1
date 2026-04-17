@@ -3,7 +3,8 @@
 # 参考 openpi/Pi0：PaliGemma 处理 image+text (prefix)，Gemma expert 处理 state+action+timestep (suffix)。
 # Flow matching 训练：预测速度场 u_t = noise - actions。
 #
-# 训练管线保持与 VLATrainer 兼容，输入/输出接口与 VLAQwen3HF 一致。
+# 关键设计：action expert 的 num_layers / num_kv_heads / head_dim 与 VLM language model 对齐，
+# 这样 VLM forward 产出的 past_key_values 可以直接作为 expert 的 prefix KV cache，无需额外投影。
 
 from __future__ import annotations
 
@@ -71,11 +72,10 @@ class VLAGemmaHF(nn.Module):
     基于 HuggingFace PaliGemma + Gemma action expert 的 VLA 模型。
 
     架构参考 openpi/Pi0：
-      - PaliGemma (SigLIP vision + Gemma LM) 处理 image + text → prefix hidden / KV cache
-      - 独立 Gemma expert 处理 state + noisy_action + timestep → 预测速度场
+      - PaliGemma (SigLIP vision + Gemma LM) 处理 image + text → past_key_values (KV cache)
+      - 独立 Gemma expert 复用 VLM 的 KV cache 作为 prefix，处理 state + noisy_action + timestep → 预测速度场
+      - Expert 的 num_layers / num_kv_heads / head_dim 与 VLM language model 对齐，KV cache 直接复用
       - Flow matching 训练（MSE on velocity）
-
-    输出接口与 VLAQwen3HF / AffordVLA 一致，兼容 VLATrainer。
     """
 
     def __init__(self, config: ModelConfig, **kwargs):
@@ -96,7 +96,16 @@ class VLAGemmaHF(nn.Module):
         )
         self._model_name = model_name
 
+        # ---- 从 VLM language model 读取关键维度 ----
+        vlm_text_cfg = self.vlm.config.text_config
+        vlm_hidden = vlm_text_cfg.hidden_size         # e.g. 2048
+        vlm_layers = vlm_text_cfg.num_hidden_layers    # e.g. 18
+        vlm_kv_heads = vlm_text_cfg.num_key_value_heads  # e.g. 1
+        vlm_heads = vlm_text_cfg.num_attention_heads     # e.g. 8
+        vlm_head_dim = vlm_text_cfg.head_dim             # e.g. 256
+
         # ---- Action expert: Gemma ----
+        # 关键：层数/kv_heads/head_dim 对齐 VLM，这样 VLM 的 past_key_values 可以直接复用
         if GemmaForCausalLM is None or GemmaConfig is None:
             raise ImportError("VLAGemmaHF 需要 transformers 支持 GemmaForCausalLM")
 
@@ -106,24 +115,24 @@ class VLAGemmaHF(nn.Module):
         self.fixed_action_dim = fixed_action_dim
         self.action_horizon = num_actions_chunk
 
-        # expert config — 默认对齐 Pi0 的 gemma_300m 规格，可通过 ModelConfig 覆盖
-        expert_hidden = getattr(config, "action_head_flow_matching_dim", 1024)
-        expert_layers = getattr(config, "action_head_flow_matching_layers", 18)
-        expert_heads = getattr(config, "action_head_flow_matching_heads", 8)
-        expert_kv_heads = getattr(config, "action_head_flow_matching_kv_heads", 1)
+        # expert hidden 可以自定义（投影层会适配），但层数/kv结构必须对齐 VLM
+        expert_hidden = getattr(config, "action_head_flow_matching_dim", vlm_hidden)
         expert_intermediate = getattr(config, "action_head_flow_matching_intermediate_size", 4096)
 
         expert_cfg = GemmaConfig(
             hidden_size=expert_hidden,
-            num_hidden_layers=expert_layers,
-            num_attention_heads=expert_heads,
-            num_key_value_heads=expert_kv_heads,
-            head_dim=expert_hidden // expert_heads,
+            num_hidden_layers=vlm_layers,       # 对齐 VLM
+            num_attention_heads=vlm_heads,       # 对齐 VLM
+            num_key_value_heads=vlm_kv_heads,    # 对齐 VLM
+            head_dim=vlm_head_dim,               # 对齐 VLM
             intermediate_size=expert_intermediate,
-            vocab_size=1,  # unused, embed_tokens will be removed
+            vocab_size=1,  # unused
         )
         self.action_expert = GemmaForCausalLM(config=expert_cfg)
         self.action_expert.model.embed_tokens = None  # Pi0-style: no token embedding
+
+        log.info(f"VLAGemmaHF expert: hidden={expert_hidden}, layers={vlm_layers}, "
+                 f"heads={vlm_heads}, kv_heads={vlm_kv_heads}, head_dim={vlm_head_dim}")
 
         # ---- Projection layers (Pi0-style) ----
         self.state_proj = nn.Linear(fixed_action_dim, expert_hidden)
@@ -131,14 +140,6 @@ class VLAGemmaHF(nn.Module):
         self.action_time_mlp_in = nn.Linear(2 * expert_hidden, expert_hidden)
         self.action_time_mlp_out = nn.Linear(expert_hidden, expert_hidden)
         self.action_out_proj = nn.Linear(expert_hidden, fixed_action_dim)
-
-        # ---- VLM → Expert dimension adapter ----
-        vlm_hidden = self.vlm.config.text_config.hidden_size
-        self.hidden_size = vlm_hidden
-        if vlm_hidden != expert_hidden:
-            self.vlm_to_expert_proj = nn.Linear(vlm_hidden, expert_hidden)
-        else:
-            self.vlm_to_expert_proj = nn.Identity()
 
         # ---- Proprio ----
         if config.use_proprio:
@@ -151,6 +152,7 @@ class VLAGemmaHF(nn.Module):
         # ---- compatibility ----
         self.transformer = self.vlm
         self.vision_backbone = None
+        self.hidden_size = vlm_hidden
 
         dtype = self.vlm.dtype
         self.action_expert.to(dtype)
@@ -159,7 +161,6 @@ class VLAGemmaHF(nn.Module):
         self.action_time_mlp_in.to(dtype)
         self.action_time_mlp_out.to(dtype)
         self.action_out_proj.to(dtype)
-        self.vlm_to_expert_proj.to(dtype)
 
     # ===== Flow matching helpers =====
 
@@ -168,7 +169,6 @@ class VLAGemmaHF(nn.Module):
         B = actions.shape[0]
         device = actions.device
         noise = torch.randn_like(actions)
-        # Beta(1.5, 1.0) timestep distribution — same as Pi0
         t = torch.distributions.Beta(
             torch.tensor(1.5, device=device, dtype=torch.float32),
             torch.tensor(1.0, device=device, dtype=torch.float32),
@@ -183,14 +183,15 @@ class VLAGemmaHF(nn.Module):
         dtype = self.state_proj.weight.dtype
         device = x_t.device
 
-        # state token
-        state_tok = self.state_proj(state.to(dtype)).unsqueeze(1)  # (B, 1, D)
+        # squeeze state to (B, D) — 兼容 (B, D) / (B, 1, D) / (B, 1, 1, D)
+        s = state.to(dtype)
+        while s.dim() > 2:
+            s = s.squeeze(-2)
+        state_tok = self.state_proj(s).unsqueeze(1)  # (B, 1, D)
 
-        # timestep encoding
         time_emb = create_sinusoidal_pos_embedding(t, self.action_in_proj.out_features)
         time_emb = time_emb.to(dtype=dtype, device=device)
 
-        # action + time fusion (Pi0-style MLP)
         action_emb = self.action_in_proj(x_t.to(dtype))  # (B, T, D)
         time_emb_exp = time_emb[:, None, :].expand_as(action_emb)
         at = self.action_time_mlp_in(torch.cat([action_emb, time_emb_exp], dim=-1))
@@ -200,37 +201,53 @@ class VLAGemmaHF(nn.Module):
         suffix = torch.cat([state_tok, at], dim=1)  # (B, 1+T, D)
         return suffix
 
+    def _prepare_attention_masks_4d(self, att_2d_masks):
+        """Convert boolean 2D masks to 4D float masks for transformer."""
+        att_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_4d, 0.0, -2.3819763e38)
+
     def predict_vector_field(
         self,
         prefix_kv,
-        prefix_len: int,
+        prefix_pad_masks: torch.Tensor,
         state: torch.Tensor,
         x_t: torch.Tensor,
         t: torch.Tensor,
         pos_offset: torch.Tensor,
     ) -> torch.Tensor:
-        """Single denoising step: expert attends to prefix KV cache."""
+        """Single denoising step: expert attends to prefix KV cache from VLM.
+        与 openpi pi0_pytorch.py denoise_step 一致。
+        """
         suffix = self.embed_suffix(state, x_t, t)
         B, L = suffix.shape[:2]
+        prefix_len = prefix_pad_masks.shape[1]
 
-        # attention mask: suffix can attend to all prefix + causal within suffix
-        prefix_mask = torch.ones((B, L, prefix_len), dtype=torch.bool, device=suffix.device)
-        suffix_pad = torch.ones((B, L), dtype=torch.bool, device=suffix.device)
-        suffix_att = torch.zeros((B, L), dtype=torch.int32, device=suffix.device)
-        suffix_att[:, 0] = 1  # state token starts a new causal block
-        suffix_causal = make_att_2d_masks(suffix_pad, suffix_att)
-        full_mask = torch.cat([prefix_mask, suffix_causal], dim=2)
-        # to 4D
-        mask_4d = full_mask[:, None, :, :].to(dtype=suffix.dtype)
-        mask_4d = torch.where(mask_4d.bool(), 0.0, torch.finfo(suffix.dtype).min)
+        # Pi0-style attention mask construction (same as pi0_pytorch.py L431-L447)
+        # suffix pad & att masks
+        suffix_pad_masks = torch.ones((B, L), dtype=torch.bool, device=suffix.device)
+        suffix_att_masks = torch.zeros((B, L), dtype=torch.int32, device=suffix.device)
+        suffix_att_masks[:, 0] = 1  # state token starts new causal block
+
+        # prefix_pad_2d_masks: suffix can attend to all valid prefix positions
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(B, L, prefix_len)
+
+        # suffix causal 2d masks
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+
+        # full mask: (B, suffix_len, prefix_len + suffix_len)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
         # position ids
-        position_ids = pos_offset.view(B, 1) + torch.arange(L, device=suffix.device).unsqueeze(0)
+        position_ids = pos_offset.view(B, 1) + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        # expert forward with prefix KV cache
+        # to 4D float mask
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        # expert forward with eager attention (openpi transformers_replace)
+        self.action_expert.model.config._attn_implementation = "eager"
         out = self.action_expert.model(
             inputs_embeds=suffix,
-            attention_mask=mask_4d,
+            attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=prefix_kv,
             use_cache=False,
@@ -259,7 +276,7 @@ class VLAGemmaHF(nn.Module):
     def get_act_head_parameters():
         return tuple(["action_expert", "state_proj", "action_in_proj",
                        "action_time_mlp_in", "action_time_mlp_out",
-                       "action_out_proj", "vlm_to_expert_proj"])
+                       "action_out_proj"])
 
     @staticmethod
     def get_proprio_proj_parameters():
@@ -270,7 +287,6 @@ class VLAGemmaHF(nn.Module):
         return tuple([])
 
     def get_fsdp_basic_modules(self) -> list:
-        basic = []
         for m in [self.vlm, getattr(self.vlm, "model", None)]:
             if m is not None:
                 mods = getattr(m.__class__, "_no_split_modules", None)
@@ -293,15 +309,17 @@ class VLAGemmaHF(nn.Module):
         return None
 
     def set_activation_checkpointing(self, strategy=None):
-        def _enable(module: nn.Module):
-            if hasattr(module, "gradient_checkpointing_enable"):
-                try:
-                    module.gradient_checkpointing_enable()
-                except Exception:
-                    pass
-            for child in module.children():
-                _enable(child)
-        _enable(self.vlm)
+        # 关闭 gradient checkpointing，保证 use_cache=True 可用（获取 past_key_values 给 expert）
+        # def _enable(module: nn.Module):
+        #     if hasattr(module, "gradient_checkpointing_enable"):
+        #         try:
+        #             module.gradient_checkpointing_enable()
+        #         except Exception:
+        #             pass
+        #     for child in module.children():
+        #         _enable(child)
+        # _enable(self.vlm)
+        pass
 
     def to_empty(self, device="cpu"):
         return self.to(device)
@@ -320,13 +338,19 @@ class VLAGemmaHF(nn.Module):
     ) -> Dict[str, Any]:
         is_training = self.training or target_actions is not None
 
-        input_ids = vlm_inputs["input_ids"]
+        # 从 batch dict 中提取 VLM processor 输出的字段
+        proc_inputs = vlm_inputs.get("vlm_inputs", vlm_inputs)
+        device = next(self.vlm.parameters()).device
+        proc_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in proc_inputs.items()}
+        input_ids = proc_inputs["input_ids"]
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            # use_cache=True 获取 past_key_values，直接给 expert 用
             outputs = self.vlm(
-                **vlm_inputs,
-                output_hidden_states=True,
+                **proc_inputs,
+                output_hidden_states=False,
                 return_dict=True,
-                use_cache=not is_training,  # training 时不用 cache (activation checkpointing 兼容)
+                use_cache=True,
             )
 
         if not is_training:
@@ -335,7 +359,7 @@ class VLAGemmaHF(nn.Module):
         B = target_actions.shape[0]
         dtype = self.vlm.dtype
 
-        # flow matching: sample noisy actions
+        # flow matching
         fm = self.sample_noisy_actions(target_actions)
         noise, x_t, t = fm["noise"], fm["x_t"], fm["t"]
         timesteps = t.unsqueeze(1)
@@ -343,37 +367,23 @@ class VLAGemmaHF(nn.Module):
         assert self.config.use_proprio and action_proprio is not None, \
             "flow_matching requires action_proprio"
 
-        # prefix KV: 从 VLM hidden states 投影到 expert 维度，构造 KV cache
-        pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
+        # prefix pad masks: 哪些 prefix position 是有效的（非 padding）
+        prefix_pad_masks = (input_ids != -1).to(torch.bool)  # (B, S)
+        pos_offset = prefix_pad_masks.to(torch.int64).sum(dim=1)
 
-        # 从 hidden_states 构造伪 KV cache 给 action expert
-        # 取最后一层 hidden state，投影到 expert 维度
-        last_hidden = outputs.hidden_states[-1].to(dtype)  # (B, S, vlm_hidden)
-        prefix_emb = self.vlm_to_expert_proj(last_hidden)    # (B, S, expert_hidden)
-        prefix_len = prefix_emb.shape[1]
-
-        # 构造 expert 的 KV cache：每层复制同一份 prefix
-        expert_head_dim = self.action_expert.config.head_dim
-        expert_kv_heads = self.action_expert.config.num_key_value_heads
-        # reshape prefix as fake K/V: (B, kv_heads, S, head_dim)
-        kv = prefix_emb.view(B, prefix_len, expert_kv_heads, expert_head_dim).permute(0, 2, 1, 3)
-        from transformers.cache_utils import DynamicCache
-        past_kv = DynamicCache()
-        for _ in range(self.action_expert.config.num_hidden_layers):
-            past_kv.update(kv, kv, layer_idx=past_kv.get_seq_length())
-
-        # predict velocity
+        # 直接使用 VLM 的 past_key_values 作为 expert 的 prefix KV cache
+        past_kv = outputs.past_key_values
+        past_kv = None
         pred = self.predict_vector_field(
-            past_kv, prefix_len,
+            past_kv, prefix_pad_masks,
             action_proprio.to(dtype), x_t.to(dtype), t.to(dtype),
             pos_offset=pos_offset,
         )
         target = (noise - target_actions).to(dtype)
-        predicted_actions = None
 
         return {
             "outputs": outputs,
-            "predicted_actions": predicted_actions,
+            "predicted_actions": None,
             "diffusion_target": target,
             "diffusion_pred": pred,
             "diff_timesteps": timesteps,
@@ -385,31 +395,31 @@ class VLAGemmaHF(nn.Module):
         vlm_inputs: Dict[str, Any],
         **kwargs,
     ) -> torch.Tensor:
-        input_ids = vlm_inputs["input_ids"]
+        proc_inputs = vlm_inputs.get("vlm_inputs", vlm_inputs)
+        device = next(self.vlm.parameters()).device
+        proc_inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in proc_inputs.items()}
+        input_ids = proc_inputs["input_ids"]
         pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
-        out = self.forward(vlm_inputs=vlm_inputs)
+
+        # VLM forward once, cache KV
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            outputs = self.vlm(
+                **proc_inputs,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=True,
+            )
+        past_kv = outputs.past_key_values
+        prefix_pad_masks = (input_ids != -1).to(torch.bool)
 
         B = input_ids.shape[0]
         dtype = self.vlm.dtype
-
-        # build prefix KV from hidden states
-        last_hidden = out.hidden_states[-1].to(dtype)
-        prefix_emb = self.vlm_to_expert_proj(last_hidden)
-        prefix_len = prefix_emb.shape[1]
-
-        expert_head_dim = self.action_expert.config.head_dim
-        expert_kv_heads = self.action_expert.config.num_key_value_heads
-        kv = prefix_emb.view(B, prefix_len, expert_kv_heads, expert_head_dim).permute(0, 2, 1, 3)
-        from transformers.cache_utils import DynamicCache
-        past_kv = DynamicCache()
-        for _ in range(self.action_expert.config.num_hidden_layers):
-            past_kv.update(kv, kv, layer_idx=past_kv.get_seq_length())
 
         # Euler ODE solver
         steps = getattr(self.config, "num_diffusion_inference_steps", 10)
         dt = -1.0 / float(steps)
         x = torch.randn(
-            (B, self.num_actions_chunk, self.fixed_action_dim), device=input_ids.device, dtype=dtype
+            (B, self.num_actions_chunk, self.fixed_action_dim), device=device, dtype=dtype
         )
         t_float = 1.0
 
@@ -418,9 +428,9 @@ class VLAGemmaHF(nn.Module):
         assert state is not None, "action_proprio required for inference"
 
         for _ in range(steps):
-            t = torch.full((B,), t_float, device=input_ids.device, dtype=dtype)
+            t = torch.full((B,), t_float, device=device, dtype=dtype)
             v = self.predict_vector_field(
-                past_kv, prefix_len, state.to(dtype), x, t, pos_offset=pos_offset
+                past_kv, prefix_pad_masks, state.to(dtype), x, t, pos_offset=pos_offset
             )
             x = x + dt * v
             t_float += dt

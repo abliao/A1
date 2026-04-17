@@ -555,6 +555,121 @@ class HFQwenVLCollatorForAction:
         return out
 
 
+class HFPaliGemmaCollatorForAction:
+    """
+    HF PaliGemma 后端的 collator：
+    - PaliGemma 不支持 apply_chat_template，使用 processor(text=..., images=...) 直接处理
+    - 输出键对齐 VLATrainer.model_forward：input_ids / attention_mask / pixel_values / action / ...
+    """
+
+    def __init__(
+        self,
+        model_config,
+        use_proprio: bool = False,
+        include_metadata: bool = False,
+        base_image_input_size: tuple = (224, 224),
+        resize: str = "default",
+        pad_value: float = 0,
+    ):
+        self.model_config = model_config
+        self.use_proprio = use_proprio
+        self.include_metadata = include_metadata
+        self.base_image_input_size = (
+            (base_image_input_size, base_image_input_size)
+            if isinstance(base_image_input_size, int)
+            else tuple(base_image_input_size)
+        )
+        self.resize = resize
+        self.pad_value = pad_value
+
+        model_name = getattr(model_config, "gemma_hf_model_name_or_path", None)
+        if model_name is None:
+            raise ValueError("HFPaliGemmaCollatorForAction 需要设置 gemma_hf_model_name_or_path")
+
+        try:
+            from transformers import AutoProcessor
+        except ImportError as e:
+            raise ImportError("HFPaliGemmaCollatorForAction 需要 transformers") from e
+
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        assert len(batch) > 0, "Given an empty batch"
+
+        all_texts = []
+        all_images = []
+
+        for ex in batch:
+            # 加载图像
+            images = None
+            if "images" in ex:
+                images = [
+                    Image.fromarray(img) if isinstance(img, np.ndarray) else Image.fromarray(load_image(img))
+                    for img in ex["images"]
+                ]
+            elif "image" in ex:
+                img = ex["image"]
+                arr = img if isinstance(img, np.ndarray) else load_image(img)
+                images = [Image.fromarray(arr)]
+
+            # resize
+            resized = []
+            for img in images:
+                img_arr = np.array(img)
+                if img_arr.shape[:2] != self.base_image_input_size:
+                    from PIL import Image as PILImage
+                    img = img.resize(
+                        (self.base_image_input_size[1], self.base_image_input_size[0]),
+                        PILImage.BILINEAR,
+                    )
+                resized.append(img)
+
+            instruction = ex.get("question") or (ex.get("metadata") or {}).get("instruction", "")
+            if isinstance(instruction, bytes):
+                instruction = instruction.decode("utf-8", errors="replace")
+
+            # PaliGemma processor 要求 text 中包含 <image> token
+            num_imgs = len(resized)
+            prefix = "<image>" * num_imgs
+            all_images.append(resized[0] if num_imgs == 1 else resized)
+            all_texts.append(prefix + instruction)
+
+        # PaliGemma processor: 直接传 text + images，不需要 chat template
+        proc_out = self.processor(
+            text=all_texts,
+            images=all_images,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        out: Dict[str, Any] = {
+            "vlm_inputs": proc_out,
+            "input_ids": proc_out["input_ids"],
+        }
+
+        # 动作与 mask
+        action_list = [torch.from_numpy(np.asarray(ex["action"], dtype=np.float32).copy()) for ex in batch]
+        out["action"] = torch.stack(action_list, dim=0)
+
+        if any("action_pad_mask" in ex for ex in batch):
+            apm = [torch.from_numpy(np.asarray(ex.get("action_pad_mask"), dtype=bool).copy()) for ex in batch]
+            out["action_pad_mask"] = torch.stack(apm, dim=0)
+        else:
+            out["action_pad_mask"] = torch.zeros_like(out["action"], dtype=torch.bool)
+
+        # proprio
+        if self.use_proprio and any(ex.get("proprio") is not None for ex in batch):
+            proprio_list = [torch.from_numpy(np.asarray(ex["proprio"], dtype=np.float32).copy()) for ex in batch]
+            out["proprio"] = torch.stack(proprio_list, dim=0)
+
+        out["proprio_token_idx"] = torch.zeros((len(batch),), dtype=torch.int32)
+
+        if self.include_metadata:
+            out["metadata"] = [ex.get("metadata", {}) for ex in batch]
+
+        return out
+
+
 class DiTActionCollator:
     """用于 DiffusionTransformerAction 模型的简洁 collator"""
     

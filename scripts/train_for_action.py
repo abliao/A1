@@ -451,9 +451,13 @@ def main(cfg: TrainConfig) -> None:
             trainer.skip_next_model_load = True
 
         if not cfg.dry_run and not cfg.no_pre_train_checkpoint and cfg.load_path is None:
-            checkpoint_type = (
-                CheckpointType.sharded if cfg.save_num_checkpoints_to_keep != 0 else CheckpointType.unsharded
-            )
+            _use_fsdp2 = getattr(cfg.fsdp, "fsdp_mode", None) == FSDPMode.fsdp2
+            if _use_fsdp2:
+                checkpoint_type = CheckpointType.unsharded
+            else:
+                checkpoint_type = (
+                    CheckpointType.sharded if cfg.save_num_checkpoints_to_keep != 0 else CheckpointType.unsharded
+                )
             
             # We save a checkpoint up-front to make sure this won't fail (due to disk space or whatever).
             log.info("Saving pre-train checkpoint...")

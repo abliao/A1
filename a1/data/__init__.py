@@ -12,7 +12,7 @@ from a1.config import DataConfig, TrainConfig, ModelConfig
 from a1.data.academic_datasets import ChartQa, ScienceQAImageOnly, TextVqa, OkVqa, DocQa, \
     InfoQa, AOkVqa, Vqa2, PlotQa, FigureQa, DvQa, SceneTextQa, TabWMPDirectAnswer, \
     AndroidControl, TallyQa, AI2D, CountBenchQa, RealWorldQa, MathVista, MMMU, ClockBench
-from a1.data.collator import MMCollator, MMCollatorForAction, HFQwenVLCollatorForAction
+from a1.data.collator import MMCollator, MMCollatorForAction, HFQwenVLCollatorForAction, HFPaliGemmaCollatorForAction
 from a1.data.data_formatter import DataFormatter
 from a1.data.dataset import DeterministicDataset,IterableDatasetWrapper
 from a1.data.iterable_dataset_mixture import IterableDatasetMixture,MultiSourceIterableDataset,SimpleMultiSourceIterableDataset
@@ -364,21 +364,31 @@ def build_vla_train_dataloader(train_config: TrainConfig, device=None, use_hf_fo
     )
 
     if use_hf_format:
-        # HF(Qwen-VL) 风格：用 AutoProcessor 直接生成 input_ids + vision 张量
         base_size = getattr(train_config.data, "image_size", (224, 224)) or (224, 224)
-        vb = getattr(train_config.model, "vision_backbone", None)
-        resize_mode = getattr(vb, "resize_mode", "default") if vb else "default"
-        pad_val = getattr(train_config.model, "pad_value", 0.0)
-        collate_f = HFQwenVLCollatorForAction(
-            model_config=train_config.model,
-            use_proprio=train_config.data.use_proprio,
-            include_metadata=False,
-            add_generation_prompt=True,
-            base_image_input_size=base_size,
-            resize=resize_mode,
-            pad_value=pad_val,
-        )
-        log.info("Build HF-format VLA train dataloader (Qwen-VL AutoProcessor).")
+        if backend in ("hf_gemma", "hf_paligemma"):
+            # PaliGemma 后端：使用 PaliGemmaProcessor(text=..., images=...)
+            collate_f = HFPaliGemmaCollatorForAction(
+                model_config=train_config.model,
+                use_proprio=train_config.data.use_proprio,
+                include_metadata=False,
+                base_image_input_size=base_size,
+            )
+            log.info("Build HF-format VLA train dataloader (PaliGemma Processor).")
+        else:
+            # HF(Qwen-VL) 风格：用 AutoProcessor.apply_chat_template
+            vb = getattr(train_config.model, "vision_backbone", None)
+            resize_mode = getattr(vb, "resize_mode", "default") if vb else "default"
+            pad_val = getattr(train_config.model, "pad_value", 0.0)
+            collate_f = HFQwenVLCollatorForAction(
+                model_config=train_config.model,
+                use_proprio=train_config.data.use_proprio,
+                include_metadata=False,
+                add_generation_prompt=True,
+                base_image_input_size=base_size,
+                resize=resize_mode,
+                pad_value=pad_val,
+            )
+            log.info("Build HF-format VLA train dataloader (Qwen-VL AutoProcessor).")
     else:
         # Collator for action-style samples (Molmo)
         collate_f = MMCollatorForAction(

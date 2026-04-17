@@ -2448,7 +2448,8 @@ class VLATrainer(Trainer):
                             )
 
                     try:
-                        # Maybe save sharded checkpoint.
+                        # Maybe save sharded checkpoint (FSDP2 不支持 sharded，自动降级为 unsharded).
+                        _use_fsdp2 = getattr(self.cfg.fsdp, "fsdp_mode", None) == FSDPMode.fsdp2
                         if save_checkpoints and (
                             cancel_initiated
                             or (
@@ -2456,9 +2457,10 @@ class VLATrainer(Trainer):
                                 and self.cfg.save_num_checkpoints_to_keep != 0
                             )
                         ):
-                            log.info("Saving checkpoint...")
-                            checkpoint_path, _ = self.save_checkpoint(CheckpointType.sharded)
-                            log.info(f"Checkpoint saved to {checkpoint_path}")
+                            if not _use_fsdp2:
+                                log.info("Saving checkpoint...")
+                                checkpoint_path, _ = self.save_checkpoint(CheckpointType.sharded)
+                                log.info(f"Checkpoint saved to {checkpoint_path}")
 
                             # Remove any ephemeral checkpoints.
                             while self.ephemeral_checkpoints:
@@ -2471,7 +2473,8 @@ class VLATrainer(Trainer):
                             if cancel_initiated:
                                 save_checkpoints = False
                         elif (
-                            self.cfg.save_interval_ephemeral is not None
+                            not _use_fsdp2
+                            and self.cfg.save_interval_ephemeral is not None
                             and self.global_step % self.cfg.save_interval_ephemeral == 0
                         ):
                             log.info("Saving ephemeral checkpoint...")

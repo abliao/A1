@@ -61,5 +61,5 @@ torchrun \
   --wandb_project $WANDB_PROJECT \
   --wandb_run_name $exp_name \
   --save_overwrite \
-  --log_interval 50 \
+  --log_interval 10 \
   --num_workers 4
